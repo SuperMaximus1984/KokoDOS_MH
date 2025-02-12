@@ -9,7 +9,8 @@ class VideoProcessor:
     def __init__(self, capture_fps=10, preview_fps=10):
         self.frames_queue = queue.Queue()
         self.recording = False
-        self.cap = cv2.VideoCapture(0)
+        self.running = True
+        self.cap = cv2.VideoCapture(0)  # Camera is initialized here
         
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 448) # This is more of a request to the driver. In most cases the webcam will still be capturing at its set resolution. Change the resolution in the driver/camera software to a res closest to 448x448. Resizing here would add latency.
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 448)
@@ -33,11 +34,12 @@ class VideoProcessor:
         self.preview_thread.start()
 
     def capture_loop(self):
-        while True:
+        while self.running:
             start_time = time.time()
             
             ret, frame = self.cap.read()
             if not ret or frame is None:
+                logger.warning("Failed to capture frame from webcam.")
                 continue
 
             try:
@@ -77,7 +79,6 @@ class VideoProcessor:
 
         cv2.destroyAllWindows()
 
-
     def start_recording(self):
         if not self.recording:
             self.recording = True
@@ -93,17 +94,19 @@ class VideoProcessor:
                     self.current_frames = []
 
     def get_frames(self):
-        try:
-            frames = self.frames_queue.get(timeout=0.5)
-            logger.debug(f"Retrieved {len(frames)} video frames from queue")
-            return frames
-        except queue.Empty:
-            logger.warning("No video frames available in queue")
-            return []
+        with self.lock:
+            frames = list(self.current_frames)
+            self.current_frames = []
+        return frames
 
     def cleanup(self):
+        self.running = False
         self.preview_active = False
         self.preview_thread.join(timeout=1)
         self.capture_thread.join(timeout=1)
         self.cap.release()
         cv2.destroyAllWindows()
+
+    def release(self):
+        if self.cap:
+            self.cap.release()

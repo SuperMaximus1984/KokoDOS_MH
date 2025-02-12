@@ -41,6 +41,11 @@ DEFAULT_PERSONALITY_PREPROMPT = (
     },
 )
 
+VIDEOCHAT_KEYWORDS = {
+    "see", "look", "show", "watch", "view", "screen", "camera", "picture",
+    "image", "photo", "video", "webcam", "display"
+}
+
 
 @dataclass
 class KokodosConfig:
@@ -164,7 +169,8 @@ class Kokodos:
 
         tts_thread = threading.Thread(target=self.process_TTS_thread)
         tts_thread.start()
-        self.video_processor = video.VideoProcessor()
+        self.video_processor = None
+        self.video_thread = None
 
         if announcement:
             audio = self._tts.generate_speech_audio(announcement)
@@ -216,107 +222,118 @@ class Kokodos:
     def messages(self) -> Sequence[dict[str, str]]:
         return self._messages
 
-    @classmethod
-    def from_config(cls, config: KokodosConfig):
-        personality_preprompt = []
-        for line in config.personality_preprompt:
-            personality_preprompt.append(
-                {"role": list(line.keys())[0], "content": list(line.values())[0]}
-            )
+    @messages.setter
+    def messages(self, value: Sequence[dict[str, str]]) -> None:
+        self._messages = value
 
-        return cls(
-            completion_url=config.completion_url,
-            model=config.model,
-            tts_voice=config.tts_voice,
-            tts_api_url=config.tts_api_url,
-            api_key=config.api_key,
-            wake_word=config.wake_word,
-            personality_preprompt=personality_preprompt,
-            announcement=config.announcement,
-            interruptible=config.interruptible,
-        )
-
-    @classmethod
-    def from_yaml(cls, path: str):
-        return cls.from_config(KokodosConfig.from_yaml(path))
-
-    def start_listen_event_loop(self):
-        self.input_stream.start()
-        logger.success("Audio Modules Operational")
-        logger.success("Listening...")
-        
+    def process_LLM(self):
         while not self.shutdown_event.is_set():
             try:
-                sample, vad_confidence = self._sample_queue.get(timeout=0.1)
-                self._handle_audio_sample(sample, vad_confidence)
+                detected_text = self.llm_queue.get(timeout=0.1)
+                include_images = any(keyword in detected_text.lower() for keyword in VIDEOCHAT_KEYWORDS)
+                
+                if include_images:
+                    if not self.video_processor:
+                        try:
+                            self.video_processor = video.VideoProcessor()
+                            logger.debug("Video processor initialized.")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize video processor: {e}")
+                            self.video_processor = None
+                    if self.video_processor and (not self.video_thread or not self.video_thread.is_alive()):
+                        self.video_thread = threading.Thread(target=self.video_processor.start_recording, daemon=True)
+                        self.video_thread.start()
+                        logger.debug("Video recording started.")
+                    
+                    # Wait for video frames to be captured
+                    video_frames = []
+                    for _ in range(10):  # Retry up to 10 times
+                        video_frames = self.video_processor.get_frames() if self.video_processor else []
+                        if video_frames:
+                            break
+                        time.sleep(0.5)  # Wait for 0.5 seconds before retrying
+                else:
+                    video_frames = []
+                    if self.video_processor:
+                        self.video_processor.stop_recording()
+                        self.video_processor.cleanup()
+                        self.video_processor = None
+                        logger.debug("Video recording stopped and processor released.")
+
+                with vision.screenshot_lock:
+                    vision_image = [vision.latest_screenshot] if vision.latest_screenshot else []
+                    vision.latest_screenshot = None
+
+                all_images = vision_image + video_frames if include_images else []
+                message_content = {
+                    "role": "user",
+                    "content": detected_text
+                }
+                
+                if all_images:
+                    message_content["images"] = all_images
+                    logger.success(f"Sending {len(all_images)} images with query")
+                else:
+                    # Remove previous images from the chat history if not relevant
+                    self.messages = [msg for msg in self.messages if "images" not in msg]
+
+                self.messages.append(message_content)
+                logger.debug(f"Sending to LLM: {json.dumps(message_content, indent=2)[:500]}...")
+            
+                data = {
+                    "model": self.model,
+                    "stream": True,
+                    "messages": self.messages,
+                }
+                logger.debug(f"starting request on {self.messages=}")
+                logger.debug("Performing request to LLM server...")
+                self.latest_screenshot = None
+                try:
+                    with requests.post(
+                        self.completion_url,
+                        headers=self.prompt_headers,
+                        json=data,
+                        stream=True,
+                        timeout=60  # Increase timeout to handle larger payloads
+                    ) as response:
+                        response.raise_for_status()
+                        sentence = []
+                        for line in response.iter_lines():
+                            if self.processing is False:
+                                break  # If the stop flag is set from new voice input, halt processing
+                            if line:  # Filter out empty keep-alive new lines
+                                try:
+                                    cleaned_line = self._clean_raw_bytes(line)
+                                    if cleaned_line:  # Add check for empty cleaned line
+                                        chunk = self._process_chunk(cleaned_line)
+                                        if chunk:
+                                            sentence.append(chunk)
+                                            # If there is a pause token, send the sentence to the TTS queue
+                                            if chunk in [
+                                                #",",
+                                                ".",
+                                                "!",
+                                                "?",
+                                                ":",
+                                                ";",
+                                                "?!",
+                                                "\n",
+                                                "\n\n",
+                                            ]:
+                                                self._process_sentence(sentence)
+                                                sentence = []
+                                except Exception as e:
+                                    logger.error(f"Error processing line: {e}")
+                                    continue
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"LLM API request failed: {e}")
+                    self.tts_queue.put("I'm having trouble connecting to the Ollama API.")
+                    continue
+                if self.processing and sentence:
+                    self._process_sentence(sentence)
+                    self.tts_queue.put("<EOS>")  # Add end of stream token to the queue
             except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                self.shutdown_event.set()
-
-        self.input_stream.stop()
-
-    def _handle_audio_sample(self, sample: np.ndarray, vad_confidence: bool):
-        """
-        Handles the processing of each audio sample.
-
-        If the recording has not started, the sample is added to the circular buffer.
-
-        If the recording has started, the sample is added to the samples list, and the pause
-        limit is checked to determine when to process the detected audio.
-
-        Args:
-            sample (np.ndarray): The audio sample to process.
-            vad_confidence (bool): Whether voice activity is detected in the sample.
-        """
-        if not self._recording_started:
-            self._manage_pre_activation_buffer(sample, vad_confidence)
-        else:
-            self._process_activated_audio(sample, vad_confidence)
-
-    def _manage_pre_activation_buffer(self, sample: np.ndarray, vad_confidence: bool):
-        """
-        Manages the circular buffer of audio samples before activation (i.e., before the voice is detected).
-
-        If the buffer is full, the oldest sample is discarded to make room for new ones.
-
-        If voice activity is detected, the audio stream is stopped, and the processing is turned off
-        to prevent overlap with the LLM and TTS threads.
-
-        Args:
-            sample (np.ndarray): The audio sample to process.
-            vad_confidence (bool): Whether voice activity is detected in the sample.
-        """
-        if self._buffer.full():
-            self._buffer.get()  # Discard the oldest sample to make room for new ones
-        self._buffer.put(sample)
-
-        if vad_confidence:  # Voice activity detected
-            sd.stop()  # Stop the audio stream to prevent overlap
-            self.processing = (
-                False  # Turns off processing on threads for the LLM and TTS!!!
-            )
-            self._samples = list(self._buffer.queue)
-            self._recording_started = True
-            self.video_processor.start_recording()
-
-    def _process_activated_audio(self, sample: np.ndarray, vad_confidence: bool):
-        """
-        Processes audio samples after activation (i.e., after the wake word is detected).
-
-        Uses a pause limit to determine when to process the detected audio. This is to
-        ensure that the entire sentence is captured before processing, including slight gaps.
-        """
-
-        self._samples.append(sample)
-
-        if not vad_confidence:
-            self._gap_counter += 1
-            if self._gap_counter >= PAUSE_LIMIT // VAD_SIZE:
-                self._process_detected_audio()
-        else:
-            self._gap_counter = 0
+                time.sleep(PAUSE_TIME)
 
     def _wakeword_detected(self, text: str) -> bool:
         """
@@ -346,7 +363,8 @@ class Kokodos:
         
         logger.debug("Detected pause after speech. Processing...")
         self.input_stream.stop()
-        self.video_processor.stop_recording()
+        if self.video_processor:
+            self.video_processor.stop_recording()
         detected_text = self.asr(self._samples)
 
         if detected_text:
@@ -520,85 +538,6 @@ class Kokodos:
         percentage_played = min(int((played_samples / total_samples * 100)), 100)
         return interrupted, percentage_played
 
-    def process_LLM(self):
-        while not self.shutdown_event.is_set():
-            try:
-                detected_text = self.llm_queue.get(timeout=0.1)
-                video_frames = self.video_processor.get_frames()
-                
-                with vision.screenshot_lock:
-                    vision_image = [vision.latest_screenshot] if vision.latest_screenshot else []
-                    vision.latest_screenshot = None
-
-                all_images = vision_image + video_frames
-                message_content = {
-                    "role": "user",
-                    "content": detected_text
-                }
-                
-                if all_images:
-                    message_content["images"] = all_images
-                    logger.success(f"Sending {len(all_images)} images with query")
-
-                self.messages.append(message_content)
-                all_images = None
-                logger.debug(f"Sending to LLM: {json.dumps(message_content, indent=2)[:500]}...")
-            
-                data = {
-                    "model": self.model,
-                    "stream": True,
-                    "messages": self.messages,
-                }
-                logger.debug(f"starting request on {self.messages=}")
-                logger.debug("Performing request to LLM server...")
-                self.latest_screenshot = None
-                try:
-                    with requests.post(
-                        self.completion_url,
-                        headers=self.prompt_headers,
-                        json=data,
-                        stream=True,
-                        timeout=10
-                    ) as response:
-                        response.raise_for_status()
-                        sentence = []
-                        for line in response.iter_lines():
-                            if self.processing is False:
-                                break  # If the stop flag is set from new voice input, halt processing
-                            if line:  # Filter out empty keep-alive new lines
-                                try:
-                                    cleaned_line = self._clean_raw_bytes(line)
-                                    if cleaned_line:  # Add check for empty cleaned line
-                                        chunk = self._process_chunk(cleaned_line)
-                                        if chunk:
-                                            sentence.append(chunk)
-                                            # If there is a pause token, send the sentence to the TTS queue
-                                            if chunk in [
-                                                #",",
-                                                ".",
-                                                "!",
-                                                "?",
-                                                ":",
-                                                ";",
-                                                "?!",
-                                                "\n",
-                                                "\n\n",
-                                            ]:
-                                                self._process_sentence(sentence)
-                                                sentence = []
-                                except Exception as e:
-                                    logger.error(f"Error processing line: {e}")
-                                    continue
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"LLM API request failed: {e}")
-                    self.tts_queue.put("I'm having trouble connecting to the Ollama API.")
-                    continue
-                if self.processing and sentence:
-                    self._process_sentence(sentence)
-                    self.tts_queue.put("<EOS>")  # Add end of stream token to the queue
-            except queue.Empty:
-                time.sleep(PAUSE_TIME)
-
     def _process_sentence(self, current_sentence: List[str]):
         """
         Join text, remove inflections and actions, and send to the TTS queue.
@@ -616,6 +555,8 @@ class Kokodos:
             .replace("  ", " ")
             .replace(":", " ")
         )
+        # Remove redundant phrases like "General Conversation"
+        sentence = re.sub(r"\bGeneral Conversation\b", "", sentence)
         if sentence:
             self.tts_queue.put(sentence)
 
@@ -663,6 +604,111 @@ class Kokodos:
         except Exception as e:
             logger.error(f"Error processing chunk: {e}")
             return None
+
+    def start_listen_event_loop(self):
+        self.input_stream.start()
+        logger.success("Audio Modules Operational")
+        logger.success("Listening...")
+        
+        while not self.shutdown_event.is_set():
+            try:
+                sample, vad_confidence = self._sample_queue.get(timeout=0.1)
+                self._handle_audio_sample(sample, vad_confidence)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                self.shutdown_event.set()
+
+        self.input_stream.stop()
+        if self.video_processor:
+            self.video_processor.cleanup()
+
+    def _handle_audio_sample(self, sample: np.ndarray, vad_confidence: bool):
+        """
+        Handles the processing of each audio sample.
+
+        If the recording has not started, the sample is added to the circular buffer.
+
+        If the recording has started, the sample is added to the samples list, and the pause
+        limit is checked to determine when to process the detected audio.
+
+        Args:
+            sample (np.ndarray): The audio sample to process.
+            vad_confidence (bool): Whether voice activity is detected in the sample.
+        """
+        if not self._recording_started:
+            self._manage_pre_activation_buffer(sample, vad_confidence)
+        else:
+            self._process_activated_audio(sample, vad_confidence)
+
+    def _manage_pre_activation_buffer(self, sample: np.ndarray, vad_confidence: bool):
+        """
+        Manages the circular buffer of audio samples before activation (i.e., before the voice is detected).
+
+        If the buffer is full, the oldest sample is discarded to make room for new ones.
+
+        If voice activity is detected, the audio stream is stopped, and the processing is turned off
+        to prevent overlap with the LLM and TTS threads.
+
+        Args:
+            sample (np.ndarray): The audio sample to process.
+            vad_confidence (bool): Whether voice activity is detected in the sample.
+        """
+        if self._buffer.full():
+            self._buffer.get()  # Discard the oldest sample to make room for new ones
+        self._buffer.put(sample)
+
+        if vad_confidence:  # Voice activity detected
+            sd.stop()  # Stop the audio stream to prevent overlap
+            self.processing = (
+                False  # Turns off processing on threads for the LLM and TTS!!!
+            )
+            self._samples = list(self._buffer.queue)
+            self._recording_started = True
+            if self.video_processor:
+                self.video_processor.start_recording()
+
+    def _process_activated_audio(self, sample: np.ndarray, vad_confidence: bool):
+        """
+        Processes audio samples after activation (i.e., after the wake word is detected).
+
+        Uses a pause limit to determine when to process the detected audio. This is to
+        ensure that the entire sentence is captured before processing, including slight gaps.
+        """
+
+        self._samples.append(sample)
+
+        if not vad_confidence:
+            self._gap_counter += 1
+            if self._gap_counter >= PAUSE_LIMIT // VAD_SIZE:
+                self._process_detected_audio()
+        else:
+            self._gap_counter = 0
+
+    @classmethod
+    def from_config(cls, config: KokodosConfig):
+        personality_preprompt = []
+        for line in config.personality_preprompt:
+            personality_preprompt.append(
+                {"role": list(line.keys())[0], "content": list(line.values())[0]}
+            )
+
+        return cls(
+            completion_url=config.completion_url,
+            model=config.model,
+            tts_voice=config.tts_voice,
+            tts_api_url=config.tts_api_url,
+            api_key=config.api_key,
+            wake_word=config.wake_word,
+            personality_preprompt=personality_preprompt,
+            announcement=config.announcement,
+            interruptible=config.interruptible,
+        )
+
+    @classmethod
+    def from_yaml(cls, path: str):
+        return cls.from_config(KokodosConfig.from_yaml(path))
 
 
 def start() -> None:
